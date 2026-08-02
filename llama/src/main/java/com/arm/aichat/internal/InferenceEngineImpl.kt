@@ -240,11 +240,18 @@ internal class InferenceEngineImpl private constructor(
             _readyForSystemPrompt = false
             _state.value = InferenceEngine.State.ProcessingUserPrompt
 
-            processUserPrompt(message, predictLength, temperature, topK, topP, repeatPenalty, seed).let { result ->
-                if (result != 0) {
-                    Log.e(TAG, "Failed to process user prompt: $result")
-                    return@flow
-                }
+            val processResult = processUserPrompt(
+                message, predictLength, temperature, topK, topP, repeatPenalty, seed
+            )
+            if (processResult != 0) {
+                // Root-cause guard: a failed user-prompt setup must NOT leave the engine
+                // stuck in ProcessingUserPrompt. Restore ModelReady so the next request
+                // can run; otherwise every later prompt is discarded ("Model busy") until
+                // the process is killed. The empty generation below lets the caller decide
+                // how to handle the failure.
+                Log.e(TAG, "Failed to process user prompt: $processResult (engine state restored to ModelReady)")
+                _state.value = InferenceEngine.State.ModelReady
+                return@flow
             }
 
             Log.i(TAG, "User prompt processed. Generating assistant prompt...")

@@ -411,6 +411,7 @@ public class AutoReplyManager {
 
         XLog.i(TAG, "Auto-replying to " + finalTarget.getDisplayLabel() + ": '" + incomingMessage + "'");
 
+        try {
         executor.submit(() -> {
             try {
                 logAutoReplyStep(finalTarget, "start", "incoming='" + incomingMessage + "'");
@@ -592,6 +593,13 @@ public class AutoReplyManager {
                 }
             }
         });
+        } catch (Exception e) {
+            // Root-cause guard: a rejected submission must not leave `replying` stuck true,
+            // otherwise auto-reply stays permanently busy and every incoming message is just
+            // flagged pending and never processed.
+            XLog.e(TAG, "BusyState: auto-reply submission failed, replying=true -> false (reset)", e);
+            replying.set(false);
+        }
     }
 
     private MonitorTarget buildTarget(String name, String appName) {

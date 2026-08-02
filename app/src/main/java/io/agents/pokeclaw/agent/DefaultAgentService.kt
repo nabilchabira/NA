@@ -154,6 +154,7 @@ class DefaultAgentService : AgentService {
 
         running.set(true)
         cancelled.set(false)
+        XLog.i(TAG, "BusyState: agent running=false -> true (executeTask: task submitted)")
         var terminalCallback: (() -> Unit)? = null
 
         val callbackProxy = object : AgentCallback {
@@ -184,36 +185,57 @@ class DefaultAgentService : AgentService {
             }
         }
 
-        taskFuture = executor?.submit {
-            try {
-                runAgentLoop(userPrompt, callbackProxy)
-            } catch (e: Exception) {
-                if (terminalCallback == null) {
-                    if (cancelled.get()) {
-                        XLog.i(TAG, "Agent task cancelled (interrupted)")
-                        terminalCallback = {
-                            callback.onComplete(0, ClawApplication.instance.getString(R.string.agent_task_cancel), 0)
+        try {
+            // Null executor happens when initialize() failed part-way (e.g. LLM client creation
+            // threw). Submitting through a shut-down executor throws RejectedExecutionException.
+            // Either way the busy flag set above MUST be cleared, otherwise the agent stays
+            // permanently busy and every later task is rejected with "already running".
+            val taskExecutor = executor
+                ?: throw IllegalStateException("Agent executor is not initialized (initialize() failed?)")
+            taskFuture = taskExecutor.submit {
+                try {
+                    runAgentLoop(userPrompt, callbackProxy)
+                } catch (e: Exception) {
+                    if (terminalCallback == null) {
+                        if (cancelled.get()) {
+                            XLog.i(TAG, "Agent task cancelled (interrupted)")
+                            terminalCallback = {
+                                callback.onComplete(0, ClawApplication.instance.getString(R.string.agent_task_cancel), 0)
+                            }
+                        } else {
+                            XLog.e(TAG, "Agent execution error", e)
+                            terminalCallback = { callback.onError(0, e, 0) }
                         }
-                    } else {
-                        XLog.e(TAG, "Agent execution error", e)
-                        terminalCallback = { callback.onError(0, e, 0) }
                     }
-                }
-            } finally {
-                // Close local engine BEFORE clearing running flag so the chat engine
-                // reload (triggered by onComplete/onError) never overlaps with task engine.
-                if (::llmClient.isInitialized) {
-                    try {
-                        llmClient.close()
-                        XLog.i(TAG, "LlmClient closed after task completion")
-                    } catch (e: Exception) {
-                        XLog.w(TAG, "LlmClient close error after task", e)
+                } finally {
+                    // Close local engine BEFORE clearing running flag so the chat engine
+                    // reload (triggered by onComplete/onError) never overlaps with task engine.
+                    if (::llmClient.isInitialized) {
+                        try {
+                            llmClient.close()
+                            XLog.i(TAG, "LlmClient closed after task completion")
+                        } catch (e: Exception) {
+                            XLog.w(TAG, "LlmClient close error after task", e)
+                        }
                     }
+                    XLog.i(TAG, "BusyState: agent running=true -> false (task loop finished)")
+                    running.set(false)
+                    val terminal = terminalCallback
+                    terminalCallback = null
+                    terminal?.invoke()
                 }
-                running.set(false)
-                val terminal = terminalCallback
-                terminalCallback = null
-                terminal?.invoke()
+            }
+        } catch (e: Exception) {
+            // Root-cause guard: submission/initialization failure must never leave the
+            // agent permanently busy. Reset the flag and surface the error to the caller
+            // so the task session (TaskSessionStore) is released by its onError handler.
+            XLog.e(TAG, "BusyState: agent task submission failed, running=true -> false (reset)", e)
+            running.set(false)
+            cancelled.set(false)
+            try {
+                callback.onError(0, e, 0)
+            } catch (inner: Exception) {
+                XLog.w(TAG, "onError callback failed during submission-failure handling", inner)
             }
         }
     }

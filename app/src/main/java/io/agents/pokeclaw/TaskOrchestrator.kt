@@ -136,12 +136,23 @@ class TaskOrchestrator(
 
         ForegroundService.updateTaskStatus(ClawApplication.instance, "Preparing task...")
 
-        // Tier 1: Deterministic routing
-        val route = pipelineRouter.route(task)
+        // Tier 1: Deterministic routing (any synchronous crash must release the session,
+        // otherwise TaskSessionStore stays BUSY forever)
+        val route = try {
+            pipelineRouter.route(task)
+        } catch (e: Exception) {
+            failTaskSafely(channel, messageID, "pipeline routing failed", e)
+            return
+        }
         when (route) {
             is PipelineRouter.Route.DirectIntent -> {
                 XLog.i(TAG, "Pipeline Tier 1: DirectIntent — ${route.description}")
-                pipelineRouter.executeIntent(route.intent)
+                try {
+                    pipelineRouter.executeIntent(route.intent)
+                } catch (e: Exception) {
+                    failTaskSafely(channel, messageID, "direct intent execution failed", e)
+                    return
+                }
                 XLog.i(TAG, "onComplete: rounds=0, totalTokens=0, model=direct, answer=${route.description}")
                 taskEventCallback?.invoke(TaskEvent.Completed(route.description))
                 ChannelManager.sendMessage(channel, "✓ ${route.description}", messageID)
@@ -199,23 +210,28 @@ class TaskOrchestrator(
                         FloatingCircleManager.ensureShowing()
                         FloatingCircleManager.showTaskNotify(task, channel)
                         Thread({
-                            val skillResult = skillExecutor.execute(skill, route.params) { step, total, desc ->
-                                taskEventCallback?.invoke(TaskEvent.Progress(step, "Step $step/$total: $desc"))
-                                ForegroundService.updateTaskStatus(ClawApplication.instance, desc)
-                            }
-                            if (skillResult.success) {
-                                ChannelManager.sendMessage(channel, skillResult.message, messageID)
-                                taskEventCallback?.invoke(TaskEvent.Completed(skillResult.message))
-                                releaseTask()
-                                FloatingCircleManager.setSuccessState()
-                                ForegroundService.resetToIdle(ClawApplication.instance)
-                                onTaskFinished()
-                            } else {
-                                val fallbackGoal = skill.fallbackGoal
-                                    .let { g -> route.params.entries.fold(g) { acc, (k, v) -> acc.replace("{$k}", v) } }
-                                XLog.i(TAG, "Skill ${skill.id} failed, falling back to agent loop: $fallbackGoal")
-                                taskEventCallback?.invoke(TaskEvent.ToolAction("Retrying with AI agent"))
-                                startNewTask(channel, fallbackGoal, messageID, isFallback = true)
+                            try {
+                                val skillResult = skillExecutor.execute(skill, route.params) { step, total, desc ->
+                                    taskEventCallback?.invoke(TaskEvent.Progress(step, "Step $step/$total: $desc"))
+                                    ForegroundService.updateTaskStatus(ClawApplication.instance, desc)
+                                }
+                                if (skillResult.success) {
+                                    ChannelManager.sendMessage(channel, skillResult.message, messageID)
+                                    taskEventCallback?.invoke(TaskEvent.Completed(skillResult.message))
+                                    releaseTask()
+                                    FloatingCircleManager.setSuccessState()
+                                    ForegroundService.resetToIdle(ClawApplication.instance)
+                                    onTaskFinished()
+                                } else {
+                                    val fallbackGoal = skill.fallbackGoal
+                                        .let { g -> route.params.entries.fold(g) { acc, (k, v) -> acc.replace("{$k}", v) } }
+                                    XLog.i(TAG, "Skill ${skill.id} failed, falling back to agent loop: $fallbackGoal")
+                                    taskEventCallback?.invoke(TaskEvent.ToolAction("Retrying with AI agent"))
+                                    startNewTask(channel, fallbackGoal, messageID, isFallback = true)
+                                }
+                            } catch (e: Exception) {
+                                // Uncaught skill-thread crash would leave the session BUSY forever.
+                                failTaskSafely(channel, messageID, "skill execution crashed", e)
                             }
                         }, "skill-executor").start()
                         return
@@ -255,6 +271,7 @@ class TaskOrchestrator(
         var floatingShown = false
 
         val agentPrompt = agentPromptOverride?.takeIf { it.isNotBlank() } ?: task
+        try {
         agentService.executeTask(agentPrompt, object : AgentCallback {
             override fun onLoopStart(round: Int) {
                 flushRoundBuffer()
@@ -426,5 +443,38 @@ class TaskOrchestrator(
                 onTaskFinished()
             }
         })
+        } catch (e: Exception) {
+            // agentService.executeTask threw synchronously (e.g. executor rejected the task).
+            // The agent loop never started, so no terminal callback will fire — release the
+            // session here or TaskSessionStore stays BUSY forever.
+            failTaskSafely(channel, messageID, "agent task submission failed", e)
+        }
+    }
+
+    /**
+     * Safety net: every BUSY transition must return to IDLE. Any synchronous failure between
+     * task-lock acquisition and the agent loop lands here, so the session is always released
+     * and the caller gets a Failed event instead of a permanently stuck "task running" state.
+     */
+    private fun failTaskSafely(channel: Channel, messageID: String, reason: String, e: Exception) {
+        XLog.e(TAG, "BusyState: releasing task session (busy -> idle) due to $reason: ${e.message}", e)
+        try {
+            taskEventCallback?.invoke(TaskEvent.Failed("Task failed to start: ${e.message ?: reason}"))
+        } catch (inner: Exception) {
+            XLog.w(TAG, "taskEventCallback failed in failTaskSafely", inner)
+        }
+        try {
+            ChannelManager.sendMessage(
+                channel,
+                ClawApplication.instance.getString(R.string.channel_msg_task_error, e.message ?: reason),
+                messageID
+            )
+        } catch (inner: Exception) {
+            XLog.w(TAG, "ChannelManager.sendMessage failed in failTaskSafely", inner)
+        }
+        ForegroundService.resetToIdle(ClawApplication.instance)
+        FloatingCircleManager.setErrorState()
+        releaseTask()
+        onTaskFinished()
     }
 }

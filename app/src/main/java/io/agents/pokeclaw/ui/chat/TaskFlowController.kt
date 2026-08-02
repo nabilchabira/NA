@@ -172,7 +172,7 @@ class TaskFlowController(
         addUser(text)
         uiState.isAwaitingReply.value = true
         uiState.isTaskRunning.value = false
-        XLog.i(TAG, "sendTask: isProcessing=TRUE")
+        XLog.i(TAG, "sendTask: task submitted — isAwaitingReply=true, isTaskRunning=false, sessionGate=" + appViewModel.isTaskRunning())
         uiState.messages.add(ChatMessage(ChatMessage.Role.ASSISTANT, "..."))
 
         val taskId = "task_${System.currentTimeMillis()}"

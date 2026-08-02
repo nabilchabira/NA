@@ -32,10 +32,21 @@ class LlmEngine(private val context: Context) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (true) {
             when (val state = inference.state.value) {
-                is InferenceEngine.State.Initialized -> return
-                is InferenceEngine.State.Error -> throw state.exception
-                else -> if (System.currentTimeMillis() > deadline) {
-                    throw IllegalStateException("llama.cpp engine failed to initialize (state=$state)")
+                is InferenceEngine.State.Initialized -> {
+                    XLog.d(TAG, "engine state: Initialized (native library ready)")
+                    return
+                }
+                is InferenceEngine.State.Error -> {
+                    XLog.e(TAG, "engine state: Error during initialization: ${state.exception.message}", state.exception)
+                    throw state.exception
+                }
+                else -> {
+                    if (System.currentTimeMillis() > deadline) {
+                        throw IllegalStateException("llama.cpp engine failed to initialize (state=$state)")
+                    }
+                    if (state is InferenceEngine.State.Initializing) {
+                        XLog.d(TAG, "engine state: Initializing (waiting for native library)")
+                    }
                 }
             }
             Thread.sleep(50)
@@ -48,17 +59,27 @@ class LlmEngine(private val context: Context) {
     @Synchronized
     fun ensureLoaded(modelPath: String) {
         awaitInitialized()
-        if (loadedModelPath == modelPath && inference.state.value is InferenceEngine.State.ModelReady) {
+        val stateBefore = inference.state.value
+        if (loadedModelPath == modelPath && stateBefore is InferenceEngine.State.ModelReady) {
+            XLog.d(TAG, "ensureLoaded: model already ready ($modelPath), reusing")
             return
         }
+        XLog.i(TAG, "ensureLoaded: engine state before load = ${stateBefore::class.simpleName}")
         if (loadedModelPath != null) {
             XLog.i(TAG, "ensureLoaded: unloading previous model ${loadedModelPath?.substringAfterLast('/')}")
             unloadModel()
         }
         XLog.i(TAG, "ensureLoaded: loading $modelPath (${File(modelPath).length() / 1_000_000} MB)")
         runBlocking { inference.loadModel(modelPath) }
+        val stateAfter = inference.state.value
+        if (stateAfter !is InferenceEngine.State.ModelReady) {
+            // Model load reported success but the engine is not READY — do not trust it.
+            throw IllegalStateException(
+                "llama.cpp engine did not reach ModelReady after loadModel (state=${stateAfter::class.simpleName})"
+            )
+        }
         loadedModelPath = modelPath
-        XLog.i(TAG, "ensureLoaded: model ready")
+        XLog.i(TAG, "ensureLoaded: model READY (state=ModelReady, $modelPath)")
     }
 
     fun createConversation(config: LlmConversationConfig): LlmConversation = LlmConversation(this, config)

@@ -4,6 +4,7 @@
 package io.agents.pokeclaw
 
 import io.agents.pokeclaw.channel.Channel
+import io.agents.pokeclaw.utils.XLog
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -34,6 +35,10 @@ data class TaskSessionState(
  */
 class TaskSessionStore {
 
+    companion object {
+        private const val TAG = "TaskSessionStore"
+    }
+
     private val lock = Any()
     private val _state = MutableStateFlow(TaskSessionState())
     val state: StateFlow<TaskSessionState> = _state
@@ -49,7 +54,10 @@ class TaskSessionStore {
         autoReturnToChat: Boolean = channel == Channel.LOCAL,
     ): Boolean {
         synchronized(lock) {
-            if (_state.value.isRunning) return false
+            if (_state.value.isRunning) {
+                XLog.w(TAG, "BusyState: tryAcquire rejected (session already BUSY: ${_state.value.messageId}/${_state.value.channel})")
+                return false
+            }
             _state.value = TaskSessionState(
                 phase = TaskSessionPhase.RUNNING,
                 messageId = messageId,
@@ -59,6 +67,7 @@ class TaskSessionStore {
                 stopRequested = false,
                 autoReturnToChat = autoReturnToChat,
             )
+            XLog.i(TAG, "BusyState: task session IDLE -> BUSY (messageId=$messageId, channel=$channel, task='${taskText.take(80)}')")
             return true
         }
     }
@@ -80,6 +89,7 @@ class TaskSessionStore {
                 phase = TaskSessionPhase.STOPPING,
                 stopRequested = true,
             )
+            XLog.i(TAG, "BusyState: task session BUSY -> STOPPING (messageId=${current.messageId}, stopRequested=true)")
             return true
         }
     }
@@ -88,6 +98,11 @@ class TaskSessionStore {
         synchronized(lock) {
             val current = _state.value
             _state.value = TaskSessionState()
+            if (current.isRunning) {
+                XLog.i(TAG, "BusyState: task session ${current.phase} -> IDLE (release, messageId=${current.messageId}, channel=${current.channel})")
+            } else {
+                XLog.d(TAG, "BusyState: release() called while already IDLE (no-op)")
+            }
             return current
         }
     }
