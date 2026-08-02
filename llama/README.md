@@ -51,3 +51,7 @@ JNI signature and the `setSystemPrompt` gate are the most likely spots to drift.
 
 The official Android runtime builds the **CPU** backend only (no Vulkan/GPU in the upstream
 Android example), so no GPU/Vulkan backend selection is performed; the app always uses CPU.
+6. `src/main/cpp/logging.h` — `ai_should_log()` no longer calls `__android_log_is_loggable()`
+   below API 30 (that function is unavailable on the app's `minSdk 28`); below API 30 it
+   falls back to a plain priority comparison, which matches the default behavior when no
+   per-tag property is set.
