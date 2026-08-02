@@ -5,6 +5,8 @@ package io.agents.pokeclaw.agent.llm
 
 import android.content.Context
 import android.os.StatFs
+import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import io.agents.pokeclaw.utils.XLog
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -31,6 +33,8 @@ object LocalModelManager {
         val fileName: String,
         val sizeBytes: Long,
         val minRamGb: Int,
+        /** Name aliases used when matching persisted config to a catalog model. */
+        val aliases: List<String> = emptyList(),
         /** True when this model came from the user-supplied custom URL (#36).
          *  Custom models skip strict size-bound validation since we don't know
          *  the expected size up front. */
@@ -74,36 +78,84 @@ object LocalModelManager {
         NEUTRAL,
     }
 
-    val AVAILABLE_MODELS = listOf(
+    /** Bundled GGUF model catalog, loaded from assets/models.json at startup. */
+    val AVAILABLE_MODELS: List<ModelInfo>
+        get() = cachedModels ?: DEFAULT_MODELS
+
+    @Volatile
+    private var cachedModels: List<ModelInfo>? = null
+
+    /**
+     * Load the bundled GGUF model catalog from the model manifest (assets/models.json).
+     * Called once at app startup so model repos can be updated without code changes.
+     */
+    fun init(context: Context) {
+        cachedModels = loadManifest(context) ?: DEFAULT_MODELS
+    }
+
+    /** JSON manifest entry (assets/models.json). */
+    private data class ManifestModel(
+        @SerializedName("id") val id: String,
+        @SerializedName("displayName") val displayName: String,
+        @SerializedName("url") val url: String,
+        @SerializedName("fileName") val fileName: String,
+        @SerializedName("sizeBytes") val sizeBytes: Long,
+        @SerializedName("minRamGb") val minRamGb: Int,
+        @SerializedName("aliases") val aliases: List<String>? = null,
+    )
+
+    private data class Manifest(@SerializedName("models") val models: List<ManifestModel> = emptyList())
+
+    private fun loadManifest(context: Context): List<ModelInfo>? {
+        return try {
+            val json = context.assets.open("models.json").bufferedReader().use { it.readText() }
+            val manifest = Gson().fromJson(json, Manifest::class.java)
+            if (manifest.models.isEmpty()) return null
+            manifest.models.map { m ->
+                ModelInfo(
+                    id = m.id,
+                    displayName = m.displayName,
+                    url = m.url,
+                    fileName = m.fileName,
+                    sizeBytes = m.sizeBytes,
+                    minRamGb = m.minRamGb,
+                    aliases = m.aliases ?: emptyList(),
+                )
+            }
+        } catch (e: Exception) {
+            XLog.w(TAG, "loadManifest: failed to read models.json, using defaults", e)
+            null
+        }
+    }
+
+    /** Built-in fallback catalog (used when the manifest cannot be read, e.g. unit tests). */
+    private val DEFAULT_MODELS = listOf(
         ModelInfo(
-            id = "gemma4-e2b",
-            displayName = "Gemma 4 E2B — 2.6GB",
-            url = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm",
-            fileName = "gemma-4-E2B-it.litertlm",
-            sizeBytes = 2_580_000_000L,
-            minRamGb = 8
+            id = "qwen2.5-3b-instruct",
+            displayName = "Qwen 2.5 3B Instruct — Q4_K_M",
+            url = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+            fileName = "qwen2.5-3b-instruct-q4_k_m.gguf",
+            sizeBytes = 2_104_932_768L,
+            minRamGb = 6,
+            aliases = listOf("qwen2.5-3b-instruct", "qwen 2.5 3b instruct", "qwen2.5_3b", "qwen2.5-3b"),
         ),
         ModelInfo(
-            id = "gemma4-e4b",
-            displayName = "Gemma 4 E4B — 3.6GB",
-            url = "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm",
-            fileName = "gemma-4-E4B-it.litertlm",
-            sizeBytes = 3_650_000_000L,
-            minRamGb = 10
+            id = "qwen2.5-1.5b-instruct",
+            displayName = "Qwen 2.5 1.5B Instruct — Q4_K_M",
+            url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            fileName = "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            sizeBytes = 1_117_320_736L,
+            minRamGb = 4,
+            aliases = listOf("qwen2.5-1.5b-instruct", "qwen 2.5 1.5b instruct", "qwen2.5_1.5b", "qwen2.5-1.5b"),
         ),
     )
 
     /**
-     * Pick the best model for this device based on available RAM.
-     * Devices with 12GB+ RAM get E4B, everyone else gets E2B.
+     * Best bundled model for this device (by RAM), falling back to the default
+     * (Qwen 2.5 3B Instruct Q4_K_M) when no catalog entry is gated by RAM.
      */
     fun recommendedModel(context: Context): ModelInfo {
-        val totalRamGb = getDeviceRamGb(context)
-        return if (totalRamGb >= 12) {
-            AVAILABLE_MODELS.first { it.id == "gemma4-e4b" }
-        } else {
-            AVAILABLE_MODELS.first { it.id == "gemma4-e2b" }
-        }
+        return bestSupportedModel(context) ?: AVAILABLE_MODELS.first()
     }
 
     fun getDeviceRamGb(context: Context): Int {
@@ -391,30 +443,8 @@ object LocalModelManager {
         if (modelPath.endsWith(model.fileName.lowercase())) return true
 
         val display = localConfig.displayName.lowercase()
-        return builtInAliases(model).any { alias ->
+        return model.aliases.any { alias ->
             modelPath.contains(alias) || display.contains(alias)
-        }
-    }
-
-    private fun builtInAliases(model: ModelInfo): List<String> {
-        return when (model.id) {
-            "gemma4-e2b" -> listOf(
-                "gemma4-e2b",
-                "gemma-4-e2b",
-                "gemma 4 e2b",
-                "gemma4_2b",
-                "gemma-4-2b",
-                "gemma 4 2b",
-            )
-            "gemma4-e4b" -> listOf(
-                "gemma4-e4b",
-                "gemma-4-e4b",
-                "gemma 4 e4b",
-                "gemma4_4b",
-                "gemma-4-4b",
-                "gemma 4 4b",
-            )
-            else -> emptyList()
         }
     }
 

@@ -237,7 +237,7 @@ class DebugTaskReceiver : BroadcastReceiver() {
                 }
                 "mark_pending_gpu_init" -> {
                     val modelPath = intent.getStringExtra("backend_model_path")?.trim().orEmpty()
-                        .ifEmpty { "/debug/model.litertlm" }
+                        .ifEmpty { "/debug/model.gguf" }
                     LocalBackendHealth.debugMarkPendingGpuInit(modelPath)
                     XLog.i("DebugTaskReceiver", "Marked pending GPU init: ${LocalBackendHealth.debugStateSummary()}")
                     breadcrumb(io.agents.pokeclaw.ClawApplication.instance, "backend mark_pending_gpu_init model=$modelPath ${LocalBackendHealth.debugStateSummary()}")

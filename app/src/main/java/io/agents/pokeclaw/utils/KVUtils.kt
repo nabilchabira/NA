@@ -380,7 +380,7 @@ object KVUtils {
     fun hasGlobalPrompt(): Boolean = getGlobalPrompt().isNotBlank()
 
     // ==================== Custom Local Model URL (#36) ====================
-    // Advanced: lets user point PokeClaw at a custom .litertlm download URL
+    // Advanced: lets user point PokeClaw at a custom .gguf download URL
     // (e.g. self-hosted, HuggingFace mirrors) instead of only the built-in catalog.
     // Empty string = no custom model. fileName is derived from URL last segment.
 

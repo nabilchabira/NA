@@ -22,3 +22,6 @@ CLAUDE.local.md
 thoughts/
 .claudeignore
 /.kotlin/
+/llama/build
+/llama/.externalNativeBuild
+/llama/.cxx

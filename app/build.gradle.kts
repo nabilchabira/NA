@@ -60,6 +60,11 @@ android {
         buildConfigField("String", "APP_ORIGIN", "\"PokeClaw by agents.io | github.com/agents-io/PokeClaw\"")
         buildConfigField("String", "BUILD_FINGERPRINT", "\"${getBuildFingerprint()}\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // llama.cpp official Android runtime ships arm64-v8a + x86_64 only
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
 
@@ -154,8 +159,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // LiteRT-LM on-device LLM inference (Google AI Edge)
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.0")
+    // llama.cpp on-device LLM inference (vendored official Android runtime)
+    implementation(project(":llama"))
+    implementation(libs.kotlinx.coroutines.android)
 
     // ZXing 二维码/条形码扫描
     implementation(libs.zxing)

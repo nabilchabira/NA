@@ -26,4 +26,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "PokeClaw"
 include(":app")
+include(":llama")
  

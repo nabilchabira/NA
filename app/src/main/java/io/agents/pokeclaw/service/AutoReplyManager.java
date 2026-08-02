@@ -645,7 +645,7 @@ public class AutoReplyManager {
                 // Cloud LLM path — use the user's selected cloud provider
                 reply = generateReplyCloud(prompt);
             } else {
-                // Local LLM path — use on-device LiteRT-LM
+                // Local LLM path — use on-device llama.cpp
                 reply = generateReplyLocal(prompt);
             }
 

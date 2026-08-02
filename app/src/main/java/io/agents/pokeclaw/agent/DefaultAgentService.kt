@@ -843,9 +843,14 @@ class DefaultAgentService : AgentService {
     override fun cancel() {
         cancelled.set(true)
         if (config.provider == LlmProvider.LOCAL) {
-            // LiteRT native sendMessage is not interrupt-safe; let the current round yield
-            // naturally, then surface Task cancelled after the client closes cleanly.
-            XLog.i(TAG, "cancel: LOCAL task marked cancelled; waiting for current LiteRT round to finish safely")
+            // Abort the current llama.cpp generation at the next token boundary; the agent
+            // loop then surfaces Task cancelled after the client closes cleanly.
+            try {
+                llmClient.cancel()
+            } catch (e: Exception) {
+                XLog.w(TAG, "cancel: llmClient.cancel failed", e)
+            }
+            XLog.i(TAG, "cancel: LOCAL task marked cancelled; waiting for current llama.cpp round to finish safely")
             return
         }
         // Cloud/network-backed tasks can be aborted safely via thread interruption.

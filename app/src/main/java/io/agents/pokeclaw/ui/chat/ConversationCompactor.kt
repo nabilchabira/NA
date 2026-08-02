@@ -4,12 +4,10 @@
 package io.agents.pokeclaw.ui.chat
 
 import android.content.Context
+import io.agents.pokeclaw.agent.llm.LlmConversationConfig
+import io.agents.pokeclaw.agent.llm.LlmEngine
+import io.agents.pokeclaw.agent.llm.LlmSamplerConfig
 import io.agents.pokeclaw.utils.XLog
-import com.google.ai.edge.litertlm.Contents
-import com.google.ai.edge.litertlm.Conversation
-import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.File
 
 /**
@@ -17,7 +15,7 @@ import java.io.File
  *
  * Architecture:
  * - Compacts only on natural pauses (switch chatroom, app pause, new chat)
- * - Never compacts during active chat (avoids LiteRT-LM single-session conflict)
+ * - Never compacts during active chat (avoids single-session conflict)
  * - Writes .memory.md digest file per conversation
  * - On chatroom switch: reads .memory.md + last N messages → system prompt
  *
@@ -44,14 +42,14 @@ object ConversationCompactor {
      * Compact a conversation: summarize older messages, save digest.
      * Must be called when LLM session is available (not during active chat).
      *
-     * @param engine LiteRT-LM engine (already initialized)
+     * @param engine llama.cpp engine (already initialized)
      * @param messages all conversation messages
      * @param context Android context for file access
      * @param conversationId conversation identifier
      * @return the digest text, or null if compaction not needed/failed
      */
     fun compact(
-        engine: Engine,
+        engine: LlmEngine,
         messages: List<ChatMessage>,
         context: Context,
         conversationId: String
@@ -74,15 +72,15 @@ object ConversationCompactor {
         try {
             // Create temporary conversation for summarization
             val tempConversation = engine.createConversation(
-                ConversationConfig(
-                    systemInstruction = Contents.of("You are a summarization assistant. Summarize conversations concisely, preserving key facts, decisions, and action items."),
-                    samplerConfig = SamplerConfig(topK = 64, topP = 0.95, temperature = 0.3)
+                LlmConversationConfig(
+                    systemPrompt = "You are a summarization assistant. Summarize conversations concisely, preserving key facts, decisions, and action items.",
+                    sampler = LlmSamplerConfig(topK = 64, topP = 0.95, temperature = 0.3)
                 )
             )
 
             val prompt = "Summarize this conversation in 3-5 sentences. Keep names, dates, decisions, and action items:\n\n$olderText"
             val response = tempConversation.sendMessage(prompt)
-            val digest = response?.toString()?.trim() ?: return null
+            val digest = response.trim().ifEmpty { null } ?: return null
 
             tempConversation.close()
 

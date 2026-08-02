@@ -45,7 +45,7 @@ class AppViewModel : ViewModel() {
 
     /**
      * Called before a task starts — allows the chat UI to release its local LLM conversation
-     * so the task agent can use the same LiteRT-LM engine (only 1 session supported).
+     * so the task agent can use the same llama.cpp engine (only 1 session supported).
      */
     var onBeforeTask: (() -> Unit)? = null
 

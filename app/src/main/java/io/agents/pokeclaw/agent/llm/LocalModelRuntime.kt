@@ -4,31 +4,30 @@
 package io.agents.pokeclaw.agent.llm
 
 import android.content.Context
-import com.google.ai.edge.litertlm.Backend
-import com.google.ai.edge.litertlm.Conversation
-import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Contents
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.SamplerConfig
-import io.agents.pokeclaw.utils.KVUtils
 import io.agents.pokeclaw.utils.XLog
 
 data class LocalEngineLease(
-    val engine: Engine,
-    val backendLabel: String,
+    val engine: LlmEngine,
+    val backendLabel: String = "CPU",
 )
 
 data class LocalConversationLease(
-    val engine: Engine,
-    val conversation: Conversation,
-    val backendLabel: String,
+    val engine: LlmEngine,
+    val conversation: LlmConversation,
+    val backendLabel: String = "CPU",
 )
 
 data class LocalSingleShotResult(
     val text: String?,
-    val backendLabel: String,
+    val backendLabel: String = "CPU",
 )
 
+/**
+ * Shared local (llama.cpp) runtime facade.
+ *
+ * Public surface kept identical to the previous LiteRT version so callers
+ * (LocalLlmClient, LlmSessionManager, ChatSessionController) did not need redesigning.
+ */
 object LocalModelRuntime {
 
     private const val TAG = "LocalModelRuntime"
@@ -41,26 +40,13 @@ object LocalModelRuntime {
         modelPath: String,
         preferCpu: Boolean = false,
     ): LocalEngineLease {
-        val shouldUseCpu = LocalBackendHealth.shouldForceCpu(preferCpu)
-        if (shouldUseCpu) {
-            val engine = EngineHolder.getOrCreate(modelPath, context.cacheDir.path, Backend.CPU())
-            return LocalEngineLease(engine = engine, backendLabel = "CPU")
-        }
-
-        return try {
-            val engine = EngineHolder.getOrCreate(modelPath, context.cacheDir.path, Backend.GPU())
-            LocalEngineLease(engine = engine, backendLabel = EngineHolder.getBackendLabel(modelPath) ?: "GPU")
-        } catch (e: Exception) {
-            if (!isGpuBackendFailure(e)) throw e
-            XLog.w(TAG, "GPU runtime failed for $modelPath, retrying on CPU: ${e.message}")
-            LocalBackendHealth.noteRecoverableGpuFailure(modelPath, e)
-            forceCpuEngine(context, modelPath)
-        }
+        val engine = EngineHolder.getOrCreate(modelPath, context.cacheDir.path)
+        return LocalEngineLease(engine = engine, backendLabel = "CPU")
     }
 
     fun forceCpuEngine(context: Context, modelPath: String): LocalEngineLease {
         resetSharedEngine()
-        val engine = EngineHolder.getOrCreate(modelPath, context.cacheDir.path, Backend.CPU())
+        val engine = EngineHolder.getOrCreate(modelPath, context.cacheDir.path)
         return LocalEngineLease(engine = engine, backendLabel = "CPU")
     }
 
@@ -79,17 +65,17 @@ object LocalModelRuntime {
     fun openConversation(
         context: Context,
         modelPath: String,
-        conversationConfig: ConversationConfig,
+        conversationConfig: LlmConversationConfig,
         preferCpu: Boolean = false,
         maxRetries: Int = DEFAULT_RETRY_COUNT,
     ): LocalConversationLease {
         var lastError: Exception? = null
-        var forceCpu = preferCpu
 
         for (attempt in 1..maxRetries) {
             try {
-                val engineLease = acquireSharedEngine(context, modelPath, preferCpu = forceCpu)
+                val engineLease = acquireSharedEngine(context, modelPath, preferCpu = preferCpu)
                 val conversation = engineLease.engine.createConversation(conversationConfig)
+                conversation.reset() // applies the system prompt and clears native history
                 return LocalConversationLease(
                     engine = engineLease.engine,
                     conversation = conversation,
@@ -99,16 +85,7 @@ object LocalModelRuntime {
                 lastError = e
                 XLog.w(TAG, "openConversation attempt $attempt failed for $modelPath: ${e.message}")
 
-                if (isSessionConflict(e)) {
-                    throw IllegalStateException("Local model session already in use", e)
-                }
-
-                if (!forceCpu && isGpuBackendFailure(e)) {
-                    XLog.w(TAG, "openConversation: GPU path failed, forcing CPU for $modelPath")
-                    LocalBackendHealth.noteRecoverableGpuFailure(modelPath, e)
-                    forceCpuEngine(context, modelPath)
-                    forceCpu = true
-                } else if (attempt == DEFAULT_RESET_ATTEMPT) {
+                if (attempt == DEFAULT_RESET_ATTEMPT) {
                     XLog.w(TAG, "openConversation: resetting shared runtime for $modelPath")
                     try {
                         resetSharedEngine()
@@ -140,21 +117,17 @@ object LocalModelRuntime {
         val lease = openConversation(
             context = context,
             modelPath = modelPath,
-            conversationConfig = ConversationConfig(
-                systemInstruction = Contents.of(systemPrompt),
-                samplerConfig = SamplerConfig(
-                    topK = 64,
-                    topP = 0.95,
-                    temperature = temperature,
-                )
+            conversationConfig = LlmConversationConfig(
+                systemPrompt = systemPrompt,
+                sampler = LlmSamplerConfig(temperature = temperature),
             ),
             preferCpu = preferCpu,
         )
 
         return try {
-            val response = lease.conversation.sendMessage(prompt, emptyMap())
+            val response = lease.conversation.sendMessage(prompt)
             LocalSingleShotResult(
-                text = response.contents?.toString()?.trim(),
+                text = response.trim().ifEmpty { null },
                 backendLabel = lease.backendLabel,
             )
         } finally {
@@ -166,21 +139,9 @@ object LocalModelRuntime {
         }
     }
 
-    fun isGpuBackendFailure(error: Throwable?): Boolean {
-        val message = error?.message.orEmpty()
-        if (message.isEmpty()) return false
-        return message.contains("OpenCL", ignoreCase = true) ||
-            message.contains("GPU", ignoreCase = true) ||
-            message.contains("nativeSendMessage", ignoreCase = true) ||
-            message.contains("Failed to create engine", ignoreCase = true) ||
-            message.contains("compiled model", ignoreCase = true)
-    }
+    /** llama.cpp runs on CPU only — kept for API compatibility with existing callers. */
+    fun isGpuBackendFailure(error: Throwable?): Boolean = false
 
-    fun isSessionConflict(error: Throwable?): Boolean {
-        val message = error?.message.orEmpty()
-        if (message.isEmpty()) return false
-        return message.contains("A session already exists", ignoreCase = true) ||
-            message.contains("Only one session is supported at a time", ignoreCase = true) ||
-            message.contains("session already in use", ignoreCase = true)
-    }
+    /** No single-session conflict exists with the llama.cpp runtime — kept for API compatibility. */
+    fun isSessionConflict(error: Throwable?): Boolean = false
 }

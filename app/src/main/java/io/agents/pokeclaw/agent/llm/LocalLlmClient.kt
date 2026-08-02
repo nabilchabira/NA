@@ -6,13 +6,6 @@ package io.agents.pokeclaw.agent.llm
 import io.agents.pokeclaw.ClawApplication
 import io.agents.pokeclaw.agent.AgentConfig
 import io.agents.pokeclaw.utils.XLog
-import com.google.ai.edge.litertlm.Contents
-import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.MessageCallback
-import com.google.ai.edge.litertlm.OpenApiTool
-import com.google.ai.edge.litertlm.SamplerConfig
-import com.google.ai.edge.litertlm.tool
 import dev.langchain4j.agent.tool.ToolExecutionRequest
 import dev.langchain4j.agent.tool.ToolSpecification
 import dev.langchain4j.data.message.AiMessage
@@ -21,14 +14,14 @@ import dev.langchain4j.data.message.SystemMessage
 import dev.langchain4j.data.message.ToolExecutionResultMessage
 import dev.langchain4j.data.message.UserMessage
 import com.google.gson.Gson
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.atomic.AtomicReference
 
 /**
- * LlmClient implementation using Google LiteRT-LM SDK for on-device inference.
+ * LlmClient implementation using the official llama.cpp Android runtime for on-device inference.
  *
- * Bridges the stateless LangChain4j chat interface (full message list per call)
- * to LiteRT-LM's stateful Conversation API (incremental messages).
+ * Bridges the stateless LangChain4j chat interface (full message list per call) to the
+ * stateful llama.cpp conversation (system prompt + incremental messages). The shared engine
+ * keeps the chat-template history and KV cache, so conversation history is preserved;
+ * [LlmConversation.reset] clears it when a session is re-created.
  *
  * config.baseUrl is repurposed to hold the local model file path.
  */
@@ -36,50 +29,30 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
 
     private val GSON = Gson()
 
-    // Engine is owned by the shared local runtime.
-    // We keep a local reference only for null-check convenience.
-    private var engine: Engine? = null
-    private var conversation: com.google.ai.edge.litertlm.Conversation? = null
+    // Engine is owned by the shared local runtime (EngineHolder).
+    private var engine: LlmEngine? = null
+    private var conversation: LlmConversation? = null
     private var processedMessageCount = 0
-
-    private var gpuFailed = false
 
     private fun ensureEngine() {
         val modelPath = config.baseUrl
         val context = ClawApplication.instance
-        try {
-            val shared = LocalModelRuntime.acquireSharedEngine(
-                context = context,
-                modelPath = modelPath,
-                preferCpu = gpuFailed,
-            ).engine
-            if (engine !== shared) {
-                XLog.i(TAG, "ensureEngine: obtained shared engine for $modelPath")
-                engine = shared
-            }
-        } catch (e: Exception) {
-            if (gpuFailed || !LocalModelRuntime.isGpuBackendFailure(e)) {
-                XLog.e(TAG, "ensureEngine: failed to get engine from shared runtime", e)
-                throw e
-            }
-
-            XLog.w(TAG, "ensureEngine: GPU engine init failed, retrying on CPU: ${e.message}")
-            gpuFailed = true
-            val cpuShared = LocalModelRuntime.forceCpuEngine(context, modelPath).engine
-            if (engine !== cpuShared) {
-                XLog.i(TAG, "ensureEngine: obtained shared CPU engine for $modelPath")
-                engine = cpuShared
-            }
+        val shared = LocalModelRuntime.acquireSharedEngine(
+            context = context,
+            modelPath = modelPath,
+        ).engine
+        if (engine !== shared) {
+            XLog.i(TAG, "ensureEngine: obtained shared engine for $modelPath")
+            engine = shared
         }
     }
 
     /**
-     * Force engine to recreate with CPU backend. Called when GPU inference fails
-     * (e.g. OpenCL library not found).
+     * Recreate the shared engine (unload + reload the model) so the next call starts clean.
+     * Used as a single retry path after an inference failure.
      */
-    private fun fallbackToCpu() {
-        XLog.w(TAG, "fallbackToCpu: GPU inference failed, switching to CPU")
-        gpuFailed = true
+    private fun resetEngine() {
+        XLog.w(TAG, "resetEngine: recreating shared engine")
         try { conversation?.close() } catch (_: Exception) {}
         conversation = null
         processedMessageCount = 0
@@ -88,49 +61,32 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
     }
 
     /**
-     * Create a new conversation with system prompt and tool declarations.
+     * Create a new conversation with the system prompt.
+     *
+     * Tool specs are accepted for interface compatibility but not passed to the engine:
+     * tool calling is prompt-based and the output is parsed by [extractToolCalls], exactly
+     * as before.
      */
     private fun createConversation(systemPrompt: String, toolSpecs: List<ToolSpecification>) {
-        // LiteRT-LM only supports one session at a time — close existing first
         try { conversation?.close() } catch (_: Exception) {}
         conversation = null
 
-        // Convert tool specs to native LiteRT-LM tools
-        val nativeTools = toolSpecs.mapNotNull { spec ->
-            try {
-                val paramsJson = try { GSON.toJson(spec.parameters()) } catch (_: Exception) { "{}" }
-                com.google.ai.edge.litertlm.tool(object : com.google.ai.edge.litertlm.OpenApiTool {
-                    override fun getToolDescriptionJsonString(): String = GSON.toJson(mapOf(
-                        "name" to spec.name(),
-                        "description" to (spec.description() ?: ""),
-                        "parameters" to try { GSON.fromJson(paramsJson, Any::class.java) } catch (_: Exception) { emptyMap<String, Any>() }
-                    ))
-                    override fun execute(params: String): String = "{}" // Execution handled by DefaultAgentService
-                })
-            } catch (e: Exception) {
-                XLog.w(TAG, "Failed to wrap tool: ${spec.name()}", e)
-                null
-            }
-        }
+        XLog.i(TAG, "createConversation: systemPrompt=${systemPrompt.take(60)}..., tools declared=${toolSpecs.size}")
 
-        XLog.i(TAG, "createConversation: ${nativeTools.size} native tools")
-
-        val convConfig = ConversationConfig(
-            systemInstruction = Contents.of(systemPrompt),
-            tools = nativeTools,
-            samplerConfig = SamplerConfig(
+        val convConfig = LlmConversationConfig(
+            systemPrompt = systemPrompt,
+            sampler = LlmSamplerConfig(
                 topK = 64,
                 topP = 0.95,
                 temperature = config.temperature
             ),
-            automaticToolCalling = false  // We handle execution in DefaultAgentService
+            maxTokens = 8192
         )
 
         val lease = LocalModelRuntime.openConversation(
             context = ClawApplication.instance,
             modelPath = config.baseUrl,
             conversationConfig = convConfig,
-            preferCpu = gpuFailed,
         )
         engine = lease.engine
         conversation = lease.conversation
@@ -143,14 +99,14 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
         return try {
             chatInternal(messages, toolSpecs)
         } catch (e: Exception) {
-            // GPU inference failure (OpenCL not found) — fallback to CPU and retry once
-            if (!gpuFailed && LocalModelRuntime.isGpuBackendFailure(e)) {
-                XLog.w(TAG, "chat: GPU inference failed, retrying with CPU: ${e.message}")
-                fallbackToCpu()
-                chatInternal(messages, toolSpecs)
-            } else {
-                throw e
+            // Reset the engine and retry once on transient load/generation failures
+            XLog.w(TAG, "chat: inference failed, resetting engine and retrying: ${e.message}")
+            try {
+                resetEngine()
+            } catch (resetError: Exception) {
+                XLog.w(TAG, "chat: engine reset failed", resetError)
             }
+            chatInternal(messages, toolSpecs)
         }
     }
 
@@ -172,30 +128,15 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
             messages.size
         )
 
-        var lastResponse: Any? = null
+        var lastResponse: String? = null
 
         for (msg in newMessages) {
             when (msg) {
                 is SystemMessage -> { /* handled in createConversation */ }
                 is UserMessage -> {
-                    val conv = conversation ?: throw RuntimeException("LiteRT-LM conversation not initialized — engine may have failed to load the model")
+                    val conv = conversation ?: throw RuntimeException("llama.cpp conversation not initialized — engine may have failed to load the model")
                     XLog.d(TAG, "chat: sendMessage user (${msg.singleText().take(80)}...) sendCount=$sendCount")
-                    try {
-                        lastResponse = conv.sendMessage(msg.singleText())
-                    } catch (e: Exception) {
-                        // LiteRT-LM SDK may fail to parse tool calls with standard quotes.
-                        // Extract raw model output from error message and parse ourselves.
-                        val errorMsg = e.message ?: ""
-                        if (errorMsg.contains("Failed to parse tool calls") && errorMsg.contains("tool_call")) {
-                            XLog.w(TAG, "SDK tool call parse failed, extracting from error: ${errorMsg.take(200)}")
-                            // Extract the raw output between "from response: " and the next error description
-                            val rawOutput = errorMsg.substringAfter("from response: ").substringBefore("code block:")
-                                .ifEmpty { errorMsg.substringAfter("from response: ") }
-                            lastResponse = rawOutput.trim()
-                        } else {
-                            throw e
-                        }
-                    }
+                    lastResponse = conv.sendMessage(msg.singleText())
                     sendCount++
                 }
                 is AiMessage -> { /* already in conversation state */ }
@@ -203,21 +144,9 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
                     // Truncate tool results to prevent token overflow + reduce crash risk
                     val truncatedResult = msg.text().take(400)
                     val toolResultText = "[Tool ${msg.toolName()} result]: $truncatedResult"
-                    val conv = conversation ?: throw RuntimeException("LiteRT-LM conversation not initialized — engine may have failed to load the model")
+                    val conv = conversation ?: throw RuntimeException("llama.cpp conversation not initialized — engine may have failed to load the model")
                     XLog.d(TAG, "chat: sendMessage toolResult (${toolResultText.take(80)}...) sendCount=$sendCount")
-                    try {
-                        lastResponse = conv.sendMessage(toolResultText)
-                    } catch (e: Exception) {
-                        val errorMsg = e.message ?: ""
-                        if (errorMsg.contains("Failed to parse tool calls") && errorMsg.contains("tool_call")) {
-                            XLog.w(TAG, "SDK tool call parse failed on toolResult, extracting: ${errorMsg.take(200)}")
-                            val rawOutput = errorMsg.substringAfter("from response: ").substringBefore("code block:")
-                                .ifEmpty { errorMsg.substringAfter("from response: ") }
-                            lastResponse = rawOutput.trim()
-                        } else {
-                            throw e
-                        }
-                    }
+                    lastResponse = conv.sendMessage(toolResultText)
                     sendCount++
                 }
             }
@@ -232,50 +161,81 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
         toolSpecs: List<ToolSpecification>,
         listener: StreamingListener
     ): LlmResponse {
-        // For now, delegate to blocking chat and simulate streaming
-        // LiteRT-LM streaming requires Flow or MessageCallback which needs more integration
-        val response = chat(messages, toolSpecs)
-        if (!response.text.isNullOrEmpty()) {
-            listener.onPartialText(response.text)
+        ensureEngine()
+
+        // Same session management as chat()
+        if (processedMessageCount == 0 || messages.size < processedMessageCount || sendCount >= 8) {
+            val systemPrompt = messages.filterIsInstance<SystemMessage>().firstOrNull()?.text()
+                ?: config.systemPrompt.ifEmpty { LOCAL_SYSTEM_PROMPT }
+            createConversation(systemPrompt, toolSpecs)
+            sendCount = 0
+            processedMessageCount = 0
         }
+
+        // Find new messages to send
+        val newMessages = messages.subList(
+            processedMessageCount.coerceAtMost(messages.size),
+            messages.size
+        )
+
+        val fullText = StringBuilder()
+        try {
+            for (msg in newMessages) {
+                when (msg) {
+                    is SystemMessage -> { /* handled in createConversation */ }
+                    is UserMessage -> {
+                        val conv = conversation ?: throw RuntimeException("llama.cpp conversation not initialized — engine may have failed to load the model")
+                        conv.streamSend(msg.singleText()) { token ->
+                            fullText.append(token)
+                            listener.onPartialText(token)
+                        }
+                        sendCount++
+                    }
+                    is AiMessage -> { /* already in conversation state */ }
+                    is ToolExecutionResultMessage -> {
+                        // Truncate tool results to prevent token overflow + reduce crash risk
+                        val truncatedResult = msg.text().take(400)
+                        val toolResultText = "[Tool ${msg.toolName()} result]: $truncatedResult"
+                        val conv = conversation ?: throw RuntimeException("llama.cpp conversation not initialized — engine may have failed to load the model")
+                        conv.streamSend(toolResultText) { token ->
+                            fullText.append(token)
+                            listener.onPartialText(token)
+                        }
+                        sendCount++
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            XLog.w(TAG, "chatStreaming: stream failed", e)
+            listener.onError(e)
+            throw e
+        }
+
+        processedMessageCount = messages.size
+        val response = parseResponse(fullText.toString())
         listener.onComplete(response)
         return response
     }
 
+    override fun cancel() {
+        XLog.i(TAG, "cancel() — aborting in-flight generation")
+        try {
+            conversation?.cancel()
+        } catch (e: Exception) {
+            XLog.w(TAG, "cancel error", e)
+        }
+    }
+
     /**
-     * Parse LiteRT-LM response into LlmResponse.
+     * Parse llama.cpp response text into LlmResponse.
      *
-     * The response text may contain tool calls in Gemma's function calling format:
+     * The text may contain tool calls in function-calling format:
      * <tool_call>{"name": "tap", "arguments": {"x": 100, "y": 200}}</tool_call>
      *
      * Or it may be plain text (thinking + final answer).
      */
-    private fun parseResponse(response: Any?): LlmResponse {
-        // Check for native LiteRT-LM Message with structured tool calls
-        if (response is com.google.ai.edge.litertlm.Message) {
-            val nativeToolCalls = response.toolCalls
-            if (!nativeToolCalls.isNullOrEmpty()) {
-                val converted = nativeToolCalls.mapNotNull { tc ->
-                    try {
-                        ToolExecutionRequest.builder()
-                            .id("native_${System.currentTimeMillis()}")
-                            .name(tc.name)
-                            .arguments(GSON.toJson(tc.arguments))
-                            .build()
-                    } catch (e: Exception) {
-                        XLog.w(TAG, "Failed to convert native ToolCall: ${tc.name}", e)
-                        null
-                    }
-                }
-                if (converted.isNotEmpty()) {
-                    XLog.i(TAG, "parseResponse: ${converted.size} native tool calls from SDK")
-                    val text = response.contents?.toString()?.trim()?.ifEmpty { null }
-                    return LlmResponse(text = text, toolExecutionRequests = converted)
-                }
-            }
-        }
-
-        val responseText = response?.toString() ?: ""
+    private fun parseResponse(response: String?): LlmResponse {
+        val responseText = response ?: ""
 
         // Fallback: extract tool calls from text (for prompt-based tool calling)
         val toolCalls = extractToolCalls(responseText)
@@ -301,16 +261,6 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
         )
     }
 
-    /**
-     * Extract tool calls from model output.
-     *
-     * Gemma 4 uses special tokens for function calling. The format may be:
-     * - <tool_call>{"name":"tap","arguments":{"x":100,"y":200}}</tool_call>
-     * - ```tool_call\n{"name":"tap","arguments":{"x":100,"y":200}}\n```
-     * - Or JSON objects with "name" and "arguments" fields
-     *
-     * This parser tries multiple patterns.
-     */
     private fun extractToolCalls(text: String): List<ToolExecutionRequest> {
         val calls = mutableListOf<ToolExecutionRequest>()
 
@@ -531,6 +481,7 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
         }
     }
 
+
     override fun close() {
         XLog.i(TAG, "close() — closing conversation only (engine stays in EngineHolder)")
         try { conversation?.close() } catch (e: Exception) { XLog.w(TAG, "close conversation error", e) }
@@ -539,7 +490,6 @@ class LocalLlmClient(private val config: AgentConfig) : LlmClient {
         processedMessageCount = 0
         XLog.i(TAG, "close() — done")
     }
-
     companion object {
         private const val TAG = "LocalLlmClient"
 
@@ -571,45 +521,3 @@ Rules:
     }
 }
 
-/**
- * Wraps a LangChain4j ToolSpecification as a LiteRT-LM OpenApiTool.
- * Only declares the schema — execution is handled by the agent loop.
- */
-private class DynamicOpenApiTool(private val spec: ToolSpecification) : OpenApiTool {
-
-    override fun getToolDescriptionJsonString(): String {
-        val json = buildMap {
-            put("name", spec.name())
-            put("description", spec.description() ?: "")
-            spec.parameters()?.let { params ->
-                put("parameters", buildMap {
-                    put("type", "object")
-                    val properties = mutableMapOf<String, Any>()
-                    val required = mutableListOf<String>()
-
-                    // Extract properties from JsonObjectSchema
-                    params.properties()?.forEach { (name, schema) ->
-                        val prop = mutableMapOf<String, Any>()
-                        prop["description"] = schema.description() ?: ""
-                        prop["type"] = when (schema.javaClass.simpleName) {
-                            "JsonIntegerSchema" -> "integer"
-                            "JsonNumberSchema" -> "number"
-                            "JsonBooleanSchema" -> "boolean"
-                            else -> "string"
-                        }
-                        properties[name] = prop
-                    }
-                    put("properties", properties)
-
-                    params.required()?.let { put("required", it) }
-                })
-            }
-        }
-        return Gson().toJson(json)
-    }
-
-    override fun execute(paramsJsonString: String): String {
-        // Not called with automaticToolCalling = false
-        return """{"result": "ok"}"""
-    }
-}

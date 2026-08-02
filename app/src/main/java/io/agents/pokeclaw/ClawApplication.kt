@@ -37,6 +37,7 @@ class ClawApplication : BaseApp() {
         appViewModelInstance = getAppViewModelProvider()[AppViewModel::class.java]
         KVUtils.init(this)
         LocalBackendHealth.recoverPendingGpuCrashIfNeeded()
+        io.agents.pokeclaw.agent.llm.LocalModelManager.init(this)
         ToolRegistry.getInstance().registerAllTools(ToolRegistry.DeviceType.MOBILE)
         io.agents.pokeclaw.agent.skill.SkillRegistry.loadBuiltInSkills()
         io.agents.pokeclaw.agent.PlaybookManager.loadAll(this)

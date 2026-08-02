@@ -18,6 +18,12 @@ interface LlmClient {
     ): LlmResponse
 
     /**
+     * Abort any in-flight generation (local engine). Default is no-op for remote clients.
+     * Called when a task is cancelled; the local engine stops at the next token boundary.
+     */
+    fun cancel() {}
+
+    /**
      * Release any engine / native resources held by this client.
      * Called after task completes to free memory before reloading the chat engine.
      * Default is no-op for remote clients (OpenAI, Anthropic).

@@ -16,12 +16,11 @@ import io.agents.pokeclaw.agent.llm.LlmSessionManager
 import io.agents.pokeclaw.agent.llm.LocalModelManager
 import io.agents.pokeclaw.agent.llm.LocalModelRuntime
 import io.agents.pokeclaw.agent.llm.ModelConfigRepository
+import io.agents.pokeclaw.agent.llm.LlmConversation
+import io.agents.pokeclaw.agent.llm.LlmConversationConfig
+import io.agents.pokeclaw.agent.llm.LlmEngine
+import io.agents.pokeclaw.agent.llm.LlmSamplerConfig
 import io.agents.pokeclaw.utils.XLog
-import com.google.ai.edge.litertlm.Contents
-import com.google.ai.edge.litertlm.Conversation
-import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.File
 import java.util.concurrent.ExecutorService
 
@@ -50,9 +49,9 @@ class ChatSessionController(
         private const val BASE_SYSTEM_PROMPT = "You are a helpful AI assistant on an Android phone."
     }
 
-    private var engine: Engine? = null
+    private var engine: LlmEngine? = null
     private var loadedModelPath: String? = null
-    private var conversation: Conversation? = null
+    private var conversation: LlmConversation? = null
     private var isModelReady = false
 
     private var cloudClient: LlmClient? = null
@@ -458,9 +457,9 @@ class ChatSessionController(
                     val lease = LocalModelRuntime.openConversation(
                         context = activity,
                         modelPath = modelPath,
-                        conversationConfig = ConversationConfig(
-                            systemInstruction = Contents.of(systemPrompt),
-                            samplerConfig = SamplerConfig(topK = 64, topP = 0.95, temperature = 0.7)
+                        conversationConfig = LlmConversationConfig(
+                            systemPrompt = systemPrompt,
+                            sampler = LlmSamplerConfig(topK = 64, topP = 0.95, temperature = 0.7)
                         )
                     )
                     engine = lease.engine
@@ -559,12 +558,12 @@ class ChatSessionController(
         return conversation!!.sendMessage(text)?.toString() ?: "(no response)"
     }
 
-    private fun buildConversationConfig(systemPrompt: String? = null): ConversationConfig {
+    private fun buildConversationConfig(systemPrompt: String? = null): LlmConversationConfig {
         val finalPrompt = io.agents.pokeclaw.agent.PromptUtils
             .applyGlobalPrompt(systemPrompt ?: BASE_SYSTEM_PROMPT)
-        return ConversationConfig(
-            systemInstruction = Contents.of(finalPrompt),
-            samplerConfig = SamplerConfig(topK = 64, topP = 0.95, temperature = 0.7)
+        return LlmConversationConfig(
+            systemPrompt = finalPrompt,
+            sampler = LlmSamplerConfig(topK = 64, topP = 0.95, temperature = 0.7)
         )
     }
 
